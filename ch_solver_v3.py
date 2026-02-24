@@ -113,7 +113,7 @@ def do_solve(init_func: Function, file: chsol, boundary_key='', notes='', safe=F
         
         while not converged:
             F_phi = ((phi - phi_prev) / dt) * dphi * dx + dot(grad(dphi), grad(psi)) * dx
-            F_psi = psi * dpsi * dx - eps**2 * dot(grad(dpsi), grad(phi)) * dx - (phi**3 - phi) * dpsi * dx
+            F_psi = psi * dpsi * dx - eps**2 * dot(grad(dpsi), grad(phi)) * dx - (phi_prev**3 - phi_prev) * dpsi * dx
             F = F_phi + F_psi
             J = derivative(F, v, dv)
             
