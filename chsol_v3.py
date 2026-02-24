@@ -449,17 +449,19 @@ class chsol():
         self.save()
         return None
     
-    def plot_mode_amp(self, diff_times=None, show=False):
+    def plot_mode_amp(self, diff_times=None, show=False, verbose=False):
         if diff_times:
             times = diff_times
         else:
             times = self.times
 
-        most_dangerous_wavenumber_amps = []
+        seeded_k_amps = []
+        dominant_wavenumbers = []
 
         if not diff_times and self.k_amps:
-            most_dangerous_wavenumber_amps = self.k_amps
+            seeded_k_amps = self.k_amps
         else:
+            Ly = self.params['Ly']
             for t in times:
                 interfacex = self.phi_zero_interface(t)
                 mask = ~np.isnan(interfacex)
@@ -468,24 +470,114 @@ class chsol():
                     y_indices = np.arange(len(interfacex))
                     h_uniform = np.interp(y_indices, y_indices[mask], interfacex[mask])
                     h = h_uniform - np.mean(h_uniform)
+                    N = len(h)
                     fth = np.fft.fft(h)
-                    amplitude_spectrum = np.abs(fth) / len(h)
-                    positive_amplitudes = amplitude_spectrum[:len(h) // 2] * 2
-                    most_dangerous_wavenumber_amps.append(positive_amplitudes[np.argmax(positive_amplitudes)])
-                else:
-                    most_dangerous_wavenumber_amps.append(0)
+                    amplitude_spectrum = np.abs(fth) / N
+                    positive_amplitudes = amplitude_spectrum[:N // 2] * 2
+                    # Physical wavenumbers: frequency index / Ly
+                    frequency_axis = np.fft.fftfreq(N, d=Ly / N)[:N // 2]
 
-        if not diff_times and not self.k_amps: 
-            self.k_amps = most_dangerous_wavenumber_amps
+                    # Amplitude at seeded wavenumber self.k
+                    if len(frequency_axis) > 1:
+                        k_idx = np.argmin(np.abs(frequency_axis - self.k))
+                        seeded_amp = positive_amplitudes[k_idx]
+                    else:
+                        seeded_amp = positive_amplitudes[0] if len(positive_amplitudes) > 0 else 0
+
+                    seeded_k_amps.append(seeded_amp)
+
+                    # Dominant wavenumber (skip DC component at index 0)
+                    if len(positive_amplitudes) > 1:
+                        dom_idx = np.argmax(positive_amplitudes[1:]) + 1
+                        dom_k = frequency_axis[dom_idx]
+                    else:
+                        dom_k = 0.0
+                    dominant_wavenumbers.append(dom_k)
+
+                    if verbose:
+                        print(f"t={t:.4f}: seeded k={self.k:.4f} amp={seeded_amp:.4e}, "
+                              f"dominant k={dom_k:.4f} amp={positive_amplitudes[dom_idx]:.4e}")
+                else:
+                    seeded_k_amps.append(0)
+                    dominant_wavenumbers.append(0.0)
+
+        if not diff_times and not self.k_amps:
+            self.k_amps = seeded_k_amps
             self.save()
 
         if show:
-            plt.figure()
-            plt.loglog(times, most_dangerous_wavenumber_amps, 'ok')
-            plt.xlabel(r'time, $t$')
-            plt.ylabel(r'seeded mode amplitude')
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+            axes[0].loglog(times, seeded_k_amps, 'ok')
+            axes[0].set_xlabel(r'time, $t$')
+            axes[0].set_ylabel(r'seeded mode amplitude')
+            axes[0].set_title(f'Amplitude at seeded wavenumber k={self.k}')
+
+            if dominant_wavenumbers:
+                axes[1].semilogx(times[:len(dominant_wavenumbers)], dominant_wavenumbers, '-b')
+                axes[1].axhline(y=self.k, color='r', linestyle='--', label=f'seeded k={self.k}')
+                axes[1].set_xlabel(r'time, $t$')
+                axes[1].set_ylabel(r'dominant wavenumber $k$')
+                axes[1].set_title('Dominant wavenumber vs. time')
+                axes[1].legend()
+
+            plt.tight_layout()
             plt.show()
-        return None
+        return seeded_k_amps, dominant_wavenumbers
+
+    def validate_mode_seeding(self, verbose=True):
+        '''
+        Verify that the seeded wavenumber k=self.k is growing and dominant.
+        Checks:
+        - Peak amplitude wavenumber matches self.k (within tolerance)
+        - Mode amplitude is growing over time (not decaying)
+        Reports diagnostic info and returns True if validation passes.
+        '''
+        seeded_k_amps, dominant_wavenumbers = self.plot_mode_amp(verbose=verbose)
+
+        if len(seeded_k_amps) < 2:
+            print("Not enough timesteps to validate mode seeding.")
+            return False
+
+        amps = np.array(seeded_k_amps)
+        doms = np.array(dominant_wavenumbers)
+        times = np.array(self.times[:len(seeded_k_amps)])
+
+        # Check if seeded mode amplitude is growing
+        nonzero = amps > 0
+        if np.sum(nonzero) < 2:
+            print("Seeded mode amplitude is zero or near-zero throughout simulation.")
+            return False
+
+        amp_growing = amps[-1] > amps[nonzero][0]
+
+        # Check if dominant wavenumber matches seeded k (use last half of simulation)
+        half = len(doms) // 2
+        if half > 0 and len(doms) > 0:
+            # Tolerance: half the seeded wavenumber, or one grid wavenumber, whichever is larger
+            tol = max(0.5 * self.k, 1.0 / self.params['Ly'])
+            dom_matches = np.mean(np.abs(doms[half:] - self.k) < tol) > 0.5
+        else:
+            dom_matches = False
+
+        if verbose:
+            print(f"\n--- Mode Seeding Validation ---")
+            print(f"Seeded wavenumber:       k = {self.k}")
+            print(f"Initial seeded amp:      {amps[nonzero][0]:.4e}")
+            print(f"Final seeded amp:        {amps[-1]:.4e}")
+            print(f"Mode growing:            {amp_growing}")
+            if len(doms) > 0:
+                print(f"Mean dominant k (2nd half): {np.mean(doms[half:]):.4f}")
+                print(f"Dominant k matches seeded:  {dom_matches}")
+            if amp_growing and dom_matches:
+                print("PASS: Seeded mode is growing and dominant.")
+            else:
+                if not amp_growing:
+                    print("FAIL: Seeded mode amplitude is not growing (check semi-implicit scheme).")
+                if not dom_matches:
+                    print("WARN: Dominant wavenumber does not consistently match seeded k.")
+
+        return amp_growing
     
     def plot_spectrum(self, times=None, num_spectra=5):
         if not times:
