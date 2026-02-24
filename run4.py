@@ -2,8 +2,8 @@ from fenics import *
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
-from chsol_v3 import chsol
-from ch_solver_v3 import do_solve
+from chsol_v3_mod import chsol
+from ch_solver_v3_mod import do_solve
 import pickle
 from matplotlib.lines import Line2D
 
@@ -74,17 +74,17 @@ def im(file: chsol, phi_l=-1, phi_r=1.5, wave=False, step=False, k=0.01, a=0.01)
 ks = [1e-2]#, 2e-2, 5e-2, 7e-2, 1e-1, 2e-1, 5e-1, 7e-1, 1, 2, 5, 7, 10, 12, 15, 17]
 for k in ks:
     eps = 0.1
-    Lx = 50 # simulation box x-length
+    Lx = 200 # simulation box x-length
     wavelength = int(1/k)
     no_waves = 3
     Ly = int(no_waves * wavelength)
     nodes_per_wave = 10
-    init_x_points_per_side = 40
+    init_x_points_per_side = 30
     init_y_points = nodes_per_wave * no_waves
     deg = 1
-    t_f = 10
+    t_f = 100
     dt = 1e-2
-    phi_r = 0.6
+    phi_r = 0.9
     amp = 0.05
 
     params = {
@@ -145,10 +145,11 @@ for k in ks:
     plt.show()
     obj = do_solve(init_func, obj, boundary_key='dirichlet', bdval=phi_r, track_interface=True)
     obj.save()
-    obj.plot_mode_amp()
+    obj.plot_mode_amp(show=True)
     print(obj.k_amps)
     obj.plot_dendrite()
-    obj.make_movie()
+    stored_val, computed_val = obj.diagnose_interface_discrepancy(10)
+    #obj.make_movie()
 
 
 
