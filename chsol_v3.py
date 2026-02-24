@@ -464,7 +464,10 @@ class chsol():
                 interfacex = self.phi_zero_interface(t)
                 mask = ~np.isnan(interfacex)
                 if len(interfacex[mask]) > 0:
-                    h = interfacex[mask] - np.nanmean(interfacex)
+                    # Interpolate to uniform grid for consistent FFT array length
+                    y_indices = np.arange(len(interfacex))
+                    h_uniform = np.interp(y_indices, y_indices[mask], interfacex[mask])
+                    h = h_uniform - np.mean(h_uniform)
                     fth = np.fft.fft(h)
                     amplitude_spectrum = np.abs(fth) / len(h)
                     positive_amplitudes = amplitude_spectrum[:len(h) // 2] * 2
@@ -571,21 +574,20 @@ class chsol():
         handles = []
         colors = plt.cm.viridis(np.linspace(0, 1, len(times_to_plot)))
         
-        for plot_idx, (time_idx, t) in enumerate(zip(range(0, len(self.times), increment), times_to_plot)):
+        for plot_idx, t in enumerate(times_to_plot):
             # Get phi grid and mesh at this timestep
             phi_grid = self.phi_grid(t)
             x_mesh, y_mesh = self.mesh_coordinates(t)
             
-            # Get the interface position at this timestep from DIAGNOSTIC method
+            # Compute the interface position at this timestep
             interface_row = self.phi_zero_interface(t)
             interface_x_computed = np.nanmean(interface_row)
-            interface_x_stored = self.interface_positions[time_idx]
             
             # Create meshgrid from actual mesh coordinates
             X, Y = np.meshgrid(x_mesh, y_mesh)
             
             # Shift x-coordinates so interface is at x=0
-            X_shifted = X - interface_x_computed  # Use freshly computed value
+            X_shifted = X - interface_x_computed
             
             # Draw contour at phi=0
             cs = ax.contour(
@@ -599,12 +601,6 @@ class chsol():
             # Create legend handle
             line = plt.Line2D([0],[0], color=colors[plot_idx], linewidth=2)
             handles.append(line)
-            
-            print(f"Frame {plot_idx}:")
-            print(f"  time_idx={time_idx}, t={t:.3f}")
-            print(f"  Stored interface_x: {interface_x_stored:.6f}")
-            print(f"  Computed interface_x: {interface_x_computed:.6f}")
-            print(f"  Difference: {abs(interface_x_stored - interface_x_computed):.6f}")
         
         ax.legend(handles, [f"t={t:.3f}" for t in times_to_plot], loc='best')
         
