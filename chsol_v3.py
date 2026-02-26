@@ -1,4 +1,4 @@
-from fenics import assemble, dx, inner, grad, ln, Function, FunctionSpace, plot, RectangleMesh, Point, MixedElement, FiniteElement, conditional, lt, near, SubDomain, File, Mesh
+from fenics import assemble, dx, inner, grad, ln, Function, FunctionSpace, plot, RectangleMesh, Point, MixedElement, FiniteElement, conditional, lt, near, SubDomain, File, Mesh, Expression, FunctionAssigner, assign
 import numpy as np
 import os
 import matplotlib.pyplot as plt
@@ -29,50 +29,65 @@ u_cmap = LinearSegmentedColormap.from_list(
 
 class chsol():
     '''
-    finite element solution object
+    Cahn-Hilliard finite element solution object
+    -------------------------------------------------------------------
+    creates dictonary of stored meshes and solutions at each timestep.
+    also tracks metadata about the mesh at each timestep,
+    and has post-processing methods for data analysis and visualization.
     '''
-    def __init__(self, filename: str, 
-                 params: dict, 
-                 solution_coefs=[], 
-                 times=[], 
+    def __init__(self,
+                 filename: str, 
+                 eps: float,
+                 k: float, 
+                 Lx: float,
+                 nx: int,
+                 n_y_sample_points: int = 10,
+                 n_waves: int = 3,
+                 dt: float = 1e-3,
+                 t_f: float = 1,
+                 deg: int = 1,
                  meta={
                      'rundatetime': None, 
                      'notes': None, 
-                     'solver_params': {'min_dt': 1e-8, 'safety_factor':0.8, 'max_newton_iter': 25}
+                     'solver_params': {'min_dt': 1e-8, 'safety_factor':0.8, 'max_newton_iter': 35}
                      }
-                 ):
+                ):
         
-        eps = params['eps']
-        Lx, Ly = params['Lx'], params['Ly']
-        n_x, n_y, deg = params['n_x'], params['n_y'], params['deg'] 
-        t_f, dt = params['t_f'], params['dt']
-        k = params['k']
-        self.meta = meta
-        self.params = params
+        self.params = locals()
 
-        self.times = times
+        if k == 0:
+            Ly = 1
+            ny = 2
+        else:
+            Ly = int(n_waves / k)
+            ny = int(n_y_sample_points * n_waves)
+        
+        # important parameters for mesh creation, post-processing and analysis
+        self.eps = eps
+        self.t_f = t_f
+        self.k = k
+        self.ell = np.sqrt(2) * eps
+        self.Lx = Lx
+        self.Ly = Ly
+        self.nx = nx # number of x nodes per side of interface
+        self.ny = ny # total number of y nodes
+        self.deg = deg
+        self.t_f = t_f
+        self.dt = dt
+        self.meta = meta
+        self.times = []
         self.filename = filename
-        self.mesh_filename = filename + '_mesh.xml'
         self.mesh_trajectory_dir = filename + '_mesh_trajectory'
         self.solution_data_file = filename + '_solutions.h5'
         self.mesh_metadata_file = filename + '_mesh_metadata.json'
         
         # Create directory for mesh trajectory if it doesn't exist
         os.makedirs(self.mesh_trajectory_dir, exist_ok=True)
-        
-        self.make_mesh()
         self.build_xdmf()
+        #self.make_mesh() dont think this is necessary
 
-        self.coords = None
-        self.coords_order = None
-        self.ic_coefs = []
         self.interface_positions = []
         self.mesh_metadata = {}  # Track mesh state at each timestep - uses int keys
-
-        self.eps = eps
-        self.t_f = t_f
-        self.k = k
-        self.ell = np.sqrt(2) * eps
         self.V = 0
         self.k_amps = []
         return None
@@ -91,6 +106,25 @@ class chsol():
         xdmf_file.close()
         return None
     
+    def build_initial(self, phi_l=-1, phi_r=0.9, a=0.05, x0=0):
+        # something like this....
+        mesh = self.make_mesh()
+        fs = self.make_function_space(mesh)
+        fss = fs.sub(0).collapse()
+        phi_init, psi_init = Function(fss), Function(fss)
+        k = self.k
+        x0 = 0
+        phi_expr = Expression('x[0] < x0 + a*sin(2*pi*k*x[1]) ? phi_left: phi_right', degree=1, a=a, k=k, phi_left=phi_l, phi_right=phi_r, x0=x0)
+        psi_expr = Expression('0.0', degree=1)
+        phi_init.interpolate(phi_expr)
+        psi_init.interpolate(psi_expr)
+        assigner = FunctionAssigner(fs, [fss, fss])
+        v = Function(fs)
+        assign(v, [phi_init, psi_init])
+        self.save_solution_with_mesh(phi_init, mesh, timestep=0, t=0)
+        self.times.append(0)
+        return mesh, fs, v
+    
     def save_solution_with_mesh(self, function, mesh, timestep, t):
         '''
         Save solution function and its corresponding mesh at each timestep.
@@ -100,9 +134,9 @@ class chsol():
         mesh_file = os.path.join(self.mesh_trajectory_dir, f'mesh_{timestep:06d}.xml')
         File(mesh_file) << mesh
         
-        # Save function to XDMF (as before, for compatibility)
+        # Save function to XDMF
         xdmf_file = XDMFFile(MPI.comm_world, f"{self.filename}.xdmf")
-        xdmf_file.write_checkpoint(function, "v", timestep, append=True)
+        xdmf_file.write_checkpoint(function, "phi", timestep, append=True)
         xdmf_file.close()
         
         # Store metadata about this timestep's mesh
@@ -114,16 +148,6 @@ class chsol():
             'num_cells': mesh.num_cells()
         }
         print(f"Saved timestep {timestep} to {mesh_file}")
-        return None
-    
-    def save_xdmf(self, function, i):
-        '''
-        save solution in parallel using XDMF.
-        (Legacy method - now use save_solution_with_mesh)
-        '''
-        xdmf_file = XDMFFile(MPI.comm_world, f"{self.filename}.xdmf")
-        xdmf_file.write_checkpoint(function, "v", i, append=True)
-        xdmf_file.close()
         return None
     
     def save_mesh_metadata(self):
@@ -152,72 +176,44 @@ class chsol():
             print(f"Warning: Mesh metadata file not found at {self.mesh_metadata_file}")
         return None
     
-    def get_mesh_at_timestep(self, timestep):
+    def get_mesh(self, t):
         '''
-        Load the specific mesh that was used at a given timestep
+        Load the specific mesh that is closest to the given timestep
         '''
-        timestep = int(timestep)
-        
+        closest_index = min(range(len(self.times)), key=lambda i: abs(self.times[i] - t))
+
         if not self.mesh_metadata:
             self.load_mesh_metadata()
         
-        if timestep in self.mesh_metadata:
-            mesh_file = self.mesh_metadata[timestep]['mesh_file']
+        if closest_index in self.mesh_metadata:
+            mesh_file = self.mesh_metadata[closest_index]['mesh_file']
             if os.path.exists(mesh_file):
                 print(f"Loading mesh from {mesh_file}")
                 return Mesh(mesh_file)
             else:
                 print(f"Warning: Mesh file not found at {mesh_file}")
         else:
-            print(f"Warning: Timestep {timestep} not in metadata. Available: {list(self.mesh_metadata.keys())}")
+            print(f"Warning: Timestep {closest_index} not in metadata. Available: {list(self.mesh_metadata.keys())}")
         
-        # Fallback: use initial mesh
-        print(f"Using initial mesh as fallback")
-        return self.get_mesh()
+        return self.get_mesh(0)
     
-    def make_mesh(self, x0=0, save=True) -> RectangleMesh:
-        init_x_points, init_y_points = self.params['n_x'], self.params['n_y']
-        Lx, Ly = self.params['Lx'], self.params['Ly']
-        logmesh = RectangleMesh(Point(-Lx/2, -Ly/2), Point(Lx/2, Ly/2), 2*init_x_points, init_y_points-1)
+    def make_mesh(self, interface_positions=None, min_exponent=-6) -> RectangleMesh:
+        Lx, Ly, nx, ny = self.Lx, self.Ly, self.nx, self.ny
+        logmesh = RectangleMesh(Point(-Lx/2, -Ly/2), Point(Lx/2, Ly/2), 2*nx, ny-1) # number of cells = vertices - 1
         coords = logmesh.coordinates()
-        logarrayright = np.logspace(-6, np.log10(Lx/2 - x0), num=init_x_points)
-        logarrayleft = np.logspace(-6, np.log10(np.abs(-Lx/2 - x0)), num=init_x_points)
-        x = np.hstack([x0-logarrayleft[::-1], [x0], x0+logarrayright])
-        x[0] = -Lx/2 
-        x[-1] = Lx/2 
-        for i in range(init_y_points): 
+        for i in range(self.ny):
+            if interface_positions: 
+                x0 = interface_positions[i] 
+            else: 
+                x0 = 0
+            log_r = np.logspace(min_exponent, np.log10(Lx/2 - x0), num=nx)
+            log_l = np.logspace(min_exponent, np.log10(np.abs(-Lx/2 - x0)), num=nx)
+            x = np.hstack([x0-log_l[::-1], [x0], x0+log_r])
+            x[0] = -Lx/2 # fix ends to match domain
+            x[-1] = Lx/2 
             coords[i*len(x):(i+1)*len(x), 0] = x
         logmesh.bounding_box_tree().build(logmesh)
-        if save: 
-            File(self.mesh_filename) << logmesh
         return logmesh  
-    
-    def phi_grid(self, t, return_coords=False) -> np.meshgrid:
-        '''
-        Get phi as a grid at time t, using the appropriate mesh for that time
-        '''
-        # Find closest timestep
-        if len(self.times) == 0:
-            print("Warning: No times available")
-            return np.array([])
-        
-        idx = min(range(len(self.times)), key=lambda i: abs(self.times[i] - t))
-        
-        phi = self.phi(t)
-        mesh = self.get_mesh_at_timestep(idx)
-        
-        nx, ny = self.params['n_x'], self.params['n_y']
-        nx_vertices, ny_vertices = 2*nx + 1, ny
-        coords = mesh.coordinates()
-        order = np.lexsort((coords[:, 0], coords[:, 1]))
-        phi_sorted = phi.compute_vertex_values(mesh)[order]
-        phigrid = phi_sorted.reshape(ny_vertices, nx_vertices)
-        
-        if return_coords:
-            out = phigrid, coords
-        else:
-            out = phigrid
-        return out
     
     def save(self):
         extension = '.chsol'
@@ -229,74 +225,74 @@ class chsol():
         print('\nCH object saved to:\n' + os.getcwd() + '\n')
         return None
     
-    def phi(self, t) -> Function:
+    def phi(self, t, grid=False):
         '''
         Linear interpolation of phi at time t, using the mesh appropriate for that timestep
+        and returning grid if grid=True, and returning node coordinates if return_coords=True
         '''
+        # trivial catches/errors
         if len(self.times) == 0:
             print("Error: No solution times available")
             return None
+        if t < min(self.times) or t > max(self.times):
+            print(f'Error: requested time {t} outside of solution time range [{min(self.times)}, {max(self.times)}]')
+            return None
         
-        # Find which timestep this falls into
-        if t in self.times:
-            idx = self.times.index(t)
-            mesh = self.get_mesh_at_timestep(idx)
-        elif t > max(self.times) or t < min(self.times):
-            print(f'requested time {t} outside integration limits [{min(self.times)}, {max(self.times)}]')
-            mesh = self.get_mesh()
-        else:
-            # Find interpolation interval
-            i = 0
-            while i < len(self.times)-1 and self.times[i] < t:
-                i += 1
-            
-            # Use the mesh from the earlier timestep for interpolation
-            mesh = self.get_mesh_at_timestep(i-1)
-        
-        fs = self.make_function_space(mesh=mesh)
-        out = Function(fs)
+        mesh = self.get_mesh(t)
+        fs = self.make_function_space(mesh).sub(0).collapse()
+        phi = Function(fs)
         xdmf = XDMFFile(f"{self.filename}.xdmf")
-        
+
         if t in self.times:
-            idx = self.times.index(t)
-            xdmf.read_checkpoint(out, 'v', idx)
-        elif t > max(self.times) or t < min(self.times):
-            print('requested time outside integration limits')
+            i = self.times.index(t)
+            xdmf.read_checkpoint(phi, 'phi', i)
         else:
-            i = 0
-            while i < len(self.times)-1 and self.times[i] < t:
-                i += 1
-            
-            if i > len(self.times) - 1:
+            # interpolate between the two closest timesteps
+            i = min(range(len(self.times)), key=lambda i: abs(self.times[i] - t))
+            if i == 0 or t > self.times[i]:
+                j = i + 1
+            elif i == len(self.times) - 1 or t < self.times[i]:
+                j = i - 1
+            else:
                 print('interpolation failed')
                 xdmf.close()
-                return out
-            
-            diff = (t - self.times[i-1])/(self.times[i] - self.times[i-1])
+                return None
+            t_low = min(self.times[i], self.times[j])
+            t_hi = max(self.times[i], self.times[j])
+            diff = (t - t_low)/(t_hi - t_low)
             u = Function(fs)
             v = Function(fs)
-            xdmf.read_checkpoint(u, 'v', i-1)
-            xdmf.read_checkpoint(v, 'v', i)
+            xdmf.read_checkpoint(u, 'phi', min(i,j))
+            xdmf.read_checkpoint(v, 'phi', max(i,j))
             interp_coefs = u.vector().get_local() + (v.vector().get_local() - u.vector().get_local()) * diff
-            out.vector().set_local(interp_coefs)
-            out.vector().apply('insert')
-        
+            phi.vector().set_local(interp_coefs)
+            phi.vector().apply('insert')
+
+        def phi_grid_and_coords():
+            nx, ny = self.nx, self.ny
+            nx_vertices, ny_vertices = 2*nx + 1, ny
+            coords = mesh.coordinates()
+            order = np.lexsort((coords[:, 0], coords[:, 1]))
+            phi_sorted = phi.compute_vertex_values(mesh)[order]
+            phigrid = phi_sorted.reshape(ny_vertices, nx_vertices)
+            return phigrid, coords
+
+        if not grid:
+            out = phi
+        else:
+            phigrid, coords = phi_grid_and_coords()
+            out = phi, phigrid, coords
+            #x_vals = np.unique(coords[:, 0])
+            #y_vals = np.unique(coords[:, 1])
         xdmf.close()
         return out
     
-    def make_function_space(self, x0=0, mesh=None) -> FunctionSpace:
+    def make_function_space(self, mesh) -> FunctionSpace:
         '''
         builds mesh and function space from params        
         '''
-        deg = self.params['deg']
-        Lx, Ly = self.params['Lx'], self.params['Ly']
-        if x0 == 0 and not mesh:
-            mesh = self.get_mesh()
-        elif x0 != 0 and not mesh:
-            mesh = self.make_mesh(x0=x0, save=False)
-        elif mesh and x0 != 0:
-            print('x0 method of mesh generation deprecated. using mesh provided to make_function_space')
-
+        deg = self.deg
+        Ly = self.Ly
         P1 = FiniteElement('P', mesh.ufl_cell(), deg) 
         element = MixedElement([P1, P1])  
 
@@ -311,29 +307,53 @@ class chsol():
         V = FunctionSpace(mesh, element, constrained_domain=PeriodicBoundaryY())
         return V
     
-    def get_mesh(self) -> Mesh:
-        out = Mesh(self.mesh_filename)
-        return out
+    def phi_zero_interface(self, t):
+        '''
+        searches along each y-row for a change of sign in phi, 
+        then determines the x-position of the crossing
+        '''
+        if len(self.times) == 0:
+            print('Warning: No times available, cannot determine interface')
+            return interface_x
+        
+        phi, grid, coords = self.phi(t, grid=True)
+        ny, nx = grid.shape
+        interface_x = np.full(ny, np.nan)
+        x_vals = np.unique(coords[:, 0])
+        
+        for i in range(ny):
+            row = grid[i, :]
+            idx_cross = np.where(np.diff(np.sign(row)) != 0)[0]
+            if len(idx_cross) > 0:
+                k = idx_cross[0]
+                x0_interp = x_vals[k] - row[k]*(x_vals[k+1]-x_vals[k])/(row[k+1]-row[k]+1e-16)
+                interface_x[i] = x0_interp
+        if len(interface_x) != ny: print('Warning: number of interface positions found does not match number of y nodes')
+        if np.nan in interface_x: print('Warning: at least one row did not have a sign change, resulting in NaN interface position')
+        return interface_x
 
-    def plot_mesh(self, save=False) -> None:
+    # post-processing and visualization methods below - not essential for solve, but useful for analysis and presentation of results
+
+    def plot_mesh(self, save=False, t=0) -> None:
         '''
         show mesh
         '''
-        mesh = self.get_mesh()
-        Lx, Ly = self.params['Lx'], self.params['Ly']
+        mesh = self.get_mesh(t)
         plt.figure()
-        plot(mesh, color='black')
+        plot(mesh, color='black', linewidth=0.75)
         plt.xlabel(r'$x$')
         plt.ylabel(r'$y$', rotation=0, labelpad=15)
-        plt.ylim([-Ly/2, Ly/2])
-        plt.xlim([-Lx/2, Lx/2])
+        plt.ylim([-self.Ly/2, self.Ly/2])
+        plt.xlim([-self.Lx/2, self.Lx/2])
         name = self.filename + '_mesh'
         if save: plt.savefig(name, bbox_inches='tight', dpi=1200) 
         plt.show()
         return None
 
-    def plot_profiles(self, y0=0, num_profiles=5, times=None, xbounds=(-1, 5), num_pts=600) -> None:
+    def plot_profiles(self, y0=0, num_profiles=5, times=None, xbounds=(-5, 10), num_pts=600) -> None:
         x = np.linspace(xbounds[0], xbounds[1], num=num_pts)
+        if xbounds[0] < -self.Lx/2 or xbounds[1] > self.Lx/2:
+            print('Error: bounds set outside domain limits')
         points = np.zeros((len(x), 2))
         points[:,0] = x
         points[:,1] = y0
@@ -356,7 +376,7 @@ class chsol():
         eps = self.params['eps']
         for idx, t in enumerate(self.times):
             phi = self.phi(t)
-            mesh = self.get_mesh_at_timestep(idx)
+            mesh = self.get_mesh(t)
             total_phi = assemble(phi * dx(domain=mesh))
             net_phi.append(total_phi)
             free_en = (1/4) * assemble((phi**2 - 1)**2 * dx(domain=mesh)) + (eps**2/2) * assemble(inner(grad(phi), grad(phi)) * dx(domain=mesh))
@@ -384,36 +404,6 @@ class chsol():
             plt.savefig(picname, bbox_inches='tight')
 
         return None
-    
-    def phi_zero_interface(self, t):
-        '''
-        searches along each y-row for a change of sign in phi, 
-        then determines the x-position of the crossing
-        '''
-        grid = self.phi_grid(t)
-        
-        if grid.size == 0:
-            return np.array([])
-        
-        ny, nx = grid.shape
-        interface_x = np.full(ny, np.nan)
-        
-        # Get the mesh at this timestep to get x_vals
-        if len(self.times) == 0:
-            return interface_x
-        
-        idx = min(range(len(self.times)), key=lambda i: abs(self.times[i] - t))
-        mesh = self.get_mesh_at_timestep(idx)
-        x_vals = np.unique(mesh.coordinates()[:, 0])
-        
-        for i in range(ny):
-            row = grid[i, :]
-            idx_cross = np.where(np.diff(np.sign(row)) != 0)[0]
-            if len(idx_cross) > 0:
-                k = idx_cross[0]
-                x0_interp = x_vals[k] - row[k]*(x_vals[k+1]-x_vals[k])/(row[k+1]-row[k]+1e-16)
-                interface_x[i] = x0_interp
-        return interface_x
     
     def get_av_interface_displacements(self):
         '''
@@ -449,7 +439,7 @@ class chsol():
         self.save()
         return None
     
-    def plot_mode_amp(self, diff_times=None, show=False):
+    def plot_mode_amp(self, diff_times=None, show=False): # update to ensure that dominant mode is seeded mode, and have consistent FFT array length for all times by interpolating to uniform grid before FFT
         if diff_times:
             times = diff_times
         else:
@@ -492,7 +482,7 @@ class chsol():
             plt.show()
         return None
     
-    def plot_spectrum(self, times=None, num_spectra=5):
+    def plot_spectrum(self, times=None, num_spectra=5): # under construction...
         if not times:
             times = self.times[::len(self.times)//num_spectra]
         for t in times:
@@ -514,41 +504,6 @@ class chsol():
 
         return None
     
-    def interpolate_interface_pos(self, t):
-        if len(self.interface_positions) == 0:
-            return 0
-        
-        if t > max(self.times):
-            print('Error: t={} is outside of solved times (cannot extrapolate)'.format(t))
-            return self.interface_positions[-1]
-        elif min(self.times) < t < max(self.times):
-            j = 0
-            while j < len(self.times)-1:
-                if self.times[j] < t < self.times[j+1]:
-                    break
-                else:
-                    j += 1
-            interp_result = self.interface_positions[j] + (self.interface_positions[j+1] - self.interface_positions[j])/(self.times[j+1] - self.times[j]) * (t-self.times[j])
-        else:
-            print('Error: negative time?')
-            interp_result = self.interface_positions[0]
-        
-        return interp_result
-    
-    def mesh_coordinates(self, t):
-        '''
-        Get mesh coordinates at time t, returning sorted unique x and y values
-        '''
-        if len(self.times) == 0:
-            mesh = self.get_mesh()
-        else:
-            idx = min(range(len(self.times)), key=lambda i: abs(self.times[i] - t))
-            mesh = self.get_mesh_at_timestep(idx)
-        coords = mesh.coordinates()
-        x_vals = np.unique(coords[:, 0])
-        y_vals = np.unique(coords[:, 1])
-        return x_vals, y_vals
-
     def plot_dendrite(self, num=5, show_region=None) -> None:
         '''
         Plot dendrite morphology with interface positioned at x=0 for each frame.
@@ -574,15 +529,15 @@ class chsol():
         times_to_plot = self.times[::increment]
         
         fig, ax = plt.subplots(constrained_layout=True, figsize=(10, 8))
-        Ly = self.params['Ly']
         
         handles = []
         colors = plt.cm.viridis(np.linspace(0, 1, len(times_to_plot)))
         
-        for plot_idx, t in enumerate(times_to_plot):
+        for plot_idx, t in enumerate(times_to_plot): # replace phi_grid, mesh_coord...
             # Get phi grid and mesh at this timestep
-            phi_grid = self.phi_grid(t)
-            x_mesh, y_mesh = self.mesh_coordinates(t)
+            phi, phi_grid, coords = self.phi(t, grid=True)
+            x_mesh = np.unique(coords[:, 0])
+            y_mesh = np.unique(coords[:, 1])
             
             # Compute the interface position at this timestep
             interface_row = self.phi_zero_interface(t)
@@ -674,7 +629,8 @@ class chsol():
         times = self.times if new_times is None else new_times
 
         # Get coordinates from first frame
-        x_vals, y_vals = self.mesh_coordinates(times[0])
+        phi, initial_frame, coords = self.phi(times[0], grid=True)
+        x_vals, y_vals = np.unique(coords[:, 0]), np.unique(coords[:, 1])
 
         if bounds:
             lx, ly = bounds
@@ -688,8 +644,6 @@ class chsol():
             ax_ylim = (0, single_wavelength)
 
         fig, ax = plt.subplots(constrained_layout=True)
-
-        initial_frame = self.phi_grid(times[0])
 
         # ---- CREATE PCOLORMESH ----
         quad = ax.pcolormesh(
@@ -737,8 +691,8 @@ class chsol():
                 actual_index = len(times) - 1
             
             # Get frame data
-            frame = self.phi_grid(times[actual_index])
-            x_vals_frame, y_vals_frame = self.mesh_coordinates(times[actual_index])
+            phi, frame, coords = self.phi(times[actual_index], grid=True)
+            x_vals_frame, y_vals_fram = np.unique(coords[:, 0]), np.unique(coords[:, 1])
 
             # Update pcolormesh values
             quad.set_array(frame.ravel())
@@ -801,7 +755,7 @@ class chsol():
         plt.close(fig)
         return None
     
-    def diagnose_interface_discrepancy(self, timestep_idx):
+    def diagnose_interface_discrepancy(self, timestep_idx): # deprecated
         '''
         Compare interface detection methods for a specific timestep
         to identify the source of discrepancies.
@@ -813,17 +767,14 @@ class chsol():
         print(f"{'='*60}")
         
         # Method 1: Get phi via phi() method (post-processing path)
-        phi_func = self.phi(t)
-        mesh_loaded = self.get_mesh_at_timestep(timestep_idx)
-        
-        # Method 2: Get phi_grid (what plot_dendrite uses)
-        phi_grid = self.phi_grid(t)
+        phi_func, phi_grid, coords = self.phi(t, grid=True)
+        mesh_loaded = phi_func.function_space().mesh() # maybe change this to just directly load the mesh???
         
         # Compute interface for phi_grid method
         if phi_grid.size > 0:
             ny, nx = phi_grid.shape
             interface_x_grid = np.full(ny, np.nan)
-            x_mesh, y_mesh = self.mesh_coordinates(t)
+            x_mesh, y_mesh = np.unique(coords[:, 0]), np.unique(coords[:, 1])
             x_vals = np.unique(x_mesh)
             
             for i in range(ny):
