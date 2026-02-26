@@ -7,39 +7,35 @@ import matplotlib.pyplot as plt
 
 set_log_level(LogLevel.ERROR)
 
-def make_bcs(file: chsol, key='', bdval=1):
+def make_bcs(fs, Lx, bdval=0.9):
     left_value = -1
     right_value = bdval 
-    if key == 'dirchlet':
-        fs = file.make_function_space()
-        Lx = file.params['Lx']
+    def left(x, on_boundary):
+        return on_boundary and near(x[0], -Lx/2)
 
-        def left(x, on_boundary):
-            return on_boundary and near(x[0], -Lx/2)
+    def right(x, on_boundary):
+        return on_boundary and near(x[0], Lx/2)
 
-        def right(x, on_boundary):
-            return on_boundary and near(x[0], Lx/2)
-
-        bc_u_left = DirichletBC(fs.sub(0), left_value, left)
-        bc_u_right = DirichletBC(fs.sub(0), right_value, right)
-        bcs = [bc_u_left, bc_u_right]
-    else:
-        bcs = []
+    bc_u_left = DirichletBC(fs.sub(0), left_value, left)
+    bc_u_right = DirichletBC(fs.sub(0), right_value, right)
+    bcs = [bc_u_left, bc_u_right]
     return bcs
 
 
-def do_solve(init_func: Function, file: chsol, boundary_key='', notes='', safe=False, bdval=1, l2=False, track_interface=False) -> chsol:
-    eps = file.params['eps']
-    t_f, dt = file.params['t_f'], file.params['dt']
+def do_solve(file: chsol, bdval=0.9, notes='', safe=False, l2=False) -> chsol:
+    eps = file.eps
+    t_f, dt = file.t_f, file.dt
     min_dt, safety_factor, max_newton_iter = file.meta['solver_params'].values()
-
     t = 0
     max_dt = t_f / 10
     # initialize outputs
     times = []
     stop_sim = False
     n_suc_steps = 0
+    mesh, V, v = file.build_initial(phi_r=bdval)
+    file.interface_positions.append(0)
 
+    '''
     def get_av_interface_pos(func) -> float:
         nx_vertices = 2 * file.params['n_x'] + 1
         ny_vertices = file.params['n_y']
@@ -64,17 +60,11 @@ def do_solve(init_func: Function, file: chsol, boundary_key='', notes='', safe=F
         return av_pos
 
     def reset_mesh(func, file) -> Mesh:
-        '''
-        finds the average interface position and moves the mesh coordinates 
-        so still logarithmic in x and linear in y with logarithmic spacing 
-        centered about the average x-position of the interface
-        '''
         x0 = get_av_interface_pos(func)
         init_x_points, init_y_points = file.params['n_x'], file.params['n_y']
         Lx, Ly = file.params['Lx'], file.params['Ly']
-        current_mesh = func.function_space().mesh()
-        coords = current_mesh.coordinates()
-        
+        new_mesh = RectangleMesh(Point(-Lx/2, -Ly/2), Point(Lx/2, Ly/2), 2*init_x_points, init_y_points-1)
+        coords = new_mesh.coordinates()
         logarrayright = np.logspace(-6, np.log10(Lx/2 - x0), num=init_x_points)
         logarrayleft = np.logspace(-6, np.log10(np.abs(-Lx/2 - x0)), num=init_x_points)
         x = np.hstack([x0-logarrayleft[::-1], [x0], x0+logarrayright])
@@ -82,30 +72,21 @@ def do_solve(init_func: Function, file: chsol, boundary_key='', notes='', safe=F
         x[-1] = Lx/2 
         for i in range(init_y_points):
             coords[i*len(x):(i+1)*len(x), 0] = x
-        current_mesh.bounding_box_tree().build(current_mesh)
+        new_mesh.bounding_box_tree().build(new_mesh)
         #fig, ax = plt.subplots()
         #plot(current_mesh)
         #ax.set_aspect(Lx/Ly)
         #plt.show()
-        return current_mesh, x0
+        return new_mesh, x0
+    '''
 
-    bcs = make_bcs(file, key=boundary_key, bdval=bdval)
-    V = file.make_function_space()
-    v = Function(V)
+    bcs = make_bcs(V, file.Lx, bdval=bdval)
     dv = TrialFunction(V)
-    v_prev = init_func
-    v.assign(init_func)
     dphi, dpsi = TestFunctions(V)
+    v_prev = v
     phi_prev, psi_prev = split(v_prev)
     phi, psi = split(v)
     dx = Measure("dx", domain=V.mesh())
-    
-    phi_save, _ = v.split(deepcopy=True)
-    file.save_solution_with_mesh(phi_save, V.mesh(), n_suc_steps, t)
-    
-    times.append(t)
-    if track_interface:
-        file.interface_positions.append(0)
 
     while t < t_f:
         converged = False
@@ -141,38 +122,29 @@ def do_solve(init_func: Function, file: chsol, boundary_key='', notes='', safe=F
         # Accept the step
         n_suc_steps += 1
         t += dt
+        phi_save, _ = v.split(deepcopy=True)
         timestring = 't = {:3.6f}\tfinal = {:3.6f}'.format(t, t_f)
         print(timestring, end='\n')
         times.append(t)
-        
-        phi_save, _ = v.split(deepcopy=True)
         file.save_solution_with_mesh(phi_save, V.mesh(), n_suc_steps, t)
-        
         v_prev.assign(v)
         
-        try:
-            x0 = get_av_interface_pos(v)
-            file.interface_positions.append(x0)
-        except:
-            print("Warning: Could not compute interface position")
-            file.interface_positions.append(file.interface_positions[-1] if file.interface_positions else 0)
-
-        # Update mesh every 4 timesteps
+        # Update mesh every timestep
         # CRITICAL: Must reset all form objects to avoid FFC compilation errors
         if n_suc_steps % 1 == 0:
             print(f"Remeshing at timestep {n_suc_steps}")
             
             # Get new mesh with updated interface position
-            new_mesh, x0_new = reset_mesh(v, file)
+            new_mesh = file.make_mesh(interface_positions=file.phi_zero_interface(t))
             
             # IMPORTANT: Clear FFC cache to avoid recompilation issues
             parameters["form_compiler"]["cache_dir"] = None
             
             # Create entirely new function space on new mesh
-            V_new = file.make_function_space(x0=x0_new)
+            V_new = file.make_function_space(mesh=new_mesh)
             
             # Create new measure with new mesh
-            dx_new = Measure("dx", domain=V_new.mesh())
+            dx_new = Measure("dx", domain=new_mesh)
             
             # Interpolate solution onto new mesh carefully
             # Create intermediate functions on old space to transfer data
@@ -199,7 +171,7 @@ def do_solve(init_func: Function, file: chsol, boundary_key='', notes='', safe=F
             dphi, dpsi = TestFunctions(V)
             
             # Recompile boundary conditions on new function space
-            bcs = make_bcs(file, key=boundary_key, bdval=bdval)
+            bcs = make_bcs(V, file.Lx, bdval=bdval)
             
             print(f"Remesh complete. New mesh has {V.mesh().num_vertices()} vertices")
 
